@@ -1,93 +1,131 @@
 import streamlit as st
-import pandas as pd
 import requests
+import pandas as pd
 import networkx as nx
 from pyvis.network import Network
 import tempfile
 import os
 from fpdf import FPDF
 
-# Function to query RaMP API for pathways related to analyte
-def query_ramp(analyte_id, analyte_type):
-    url = "https://ramp-api-url/query"  # Replace with actual RaMP API endpoint
-    payload = {
-        "analyte_id": analyte_id,
-        "analyte_type": analyte_type
+# -------------------------------
+# Configuration
+# -------------------------------
+RAMP_API_URLS = [
+    "https://rampdb.nih.gov/api/query"
+]
+
+# -------------------------------
+# Helper Functions
+# -------------------------------
+
+def map_common_name_to_hmdb(common_name):
+    """Mock function to map common name to HMDB ID"""
+    # In production, replace with actual lookup or API call
+    mapping = {
+        "glucose": "HMDB0000122",
+        "lactic acid": "HMDB0000190",
+        "citrate": "HMDB0000094"
     }
-    response = requests.post(url, json=payload)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        return {}
+    return mapping.get(common_name.lower(), None)
 
-# Function to perform enrichment analysis (mock implementation)
-def enrichment_analysis(pathways):
+def query_ramp_api(analyte_id, analyte_type):
+    """Query RaMP API for pathway information"""
+    prefix = "hmdb" if analyte_type == "metabolite" else "uniprot"
+    full_id = f"{prefix}:{analyte_id}"
+    payload = {
+        "input": [full_id],
+        "type": "pathway"
+    }
+
+    for url in RAMP_API_URLS:
+        try:
+            response = requests.post(url, json=payload)
+            if response.status_code == 200:
+                return response.json()
+        except requests.exceptions.RequestException:
+            continue
+    return {}
+
+def perform_enrichment(pathway_data):
+    """Mock enrichment analysis"""
     enriched = []
-    for pathway in pathways:
+    for entry in pathway_data:
         enriched.append({
-            "Pathway": pathway["name"],
-            "Score": round(pathway["relevance_score"] * 1.5, 2),
-            "Source": pathway["source"]
+            "pathway": entry.get("pathway_name", "Unknown"),
+            "source": entry.get("source", "RaMP"),
+            "score": round(1.0 / (1 + len(entry.get("analyte_list", []))), 4)
         })
-    return enriched
+    return pd.DataFrame(enriched)
 
-# Function to create network graph
-def create_network_graph(enriched_pathways, analyte_id):
-    G = nx.Graph()
-    G.add_node(analyte_id, label="Analyte", color="red")
-    for pathway in enriched_pathways:
-        G.add_node(pathway["Pathway"], label="Pathway", color="blue")
-        G.add_edge(analyte_id, pathway["Pathway"])
-    return G
+def create_network_graph(analyte_id, pathway_df):
+    """Create a network graph using pyvis"""
+    net = Network(height="500px", width="100%", notebook=False)
+    net.add_node(analyte_id, label=analyte_id, color="red")
 
-# Function to save results as CSV
-def save_csv(enriched_pathways):
-    df = pd.DataFrame(enriched_pathways)
-    csv_path = os.path.join(tempfile.gettempdir(), "enrichment_results.csv")
-    df.to_csv(csv_path, index=False)
-    return csv_path
+    for _, row in pathway_df.iterrows():
+        net.add_node(row["pathway"], label=row["pathway"], color="lightblue")
+        net.add_edge(analyte_id, row["pathway"])
 
-# Function to save results as PDF
-def save_pdf(enriched_pathways):
-    pdf_path = os.path.join(tempfile.gettempdir(), "enrichment_results.pdf")
+    temp_dir = tempfile.mkdtemp()
+    html_path = os.path.join(temp_dir, "network.html")
+    net.show(html_path)
+    return html_path
+
+def download_csv(df):
+    return df.to_csv(index=False).encode("utf-8")
+
+def download_pdf(df):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", size=12)
-    pdf.cell(200, 10, txt="Enrichment Analysis Results", ln=True, align='C')
-    for pathway in enriched_pathways:
-        line = f"{pathway['Pathway']} | Score: {pathway['Score']} | Source: {pathway['Source']}"
+    for i, row in df.iterrows():
+        line = f"{row['pathway']} (Score: {row['score']})"
         pdf.cell(200, 10, txt=line, ln=True)
-    pdf.output(pdf_path)
-    return pdf_path
+    temp_path = tempfile.mktemp(suffix=".pdf")
+    pdf.output(temp_path)
+    return temp_path
 
-# Streamlit UI
-st.title("Multi-Omic Pathway Analysis using RaMP")
+# -------------------------------
+# Streamlit App
+# -------------------------------
 
-analyte_id = st.text_input("Enter Analyte ID (e.g., UniProt or HMDB ID):")
-analyte_type = st.selectbox("Select Analyte Type:", ["protein", "metabolite"])
+st.title("Multi-Omic Pathway Explorer using RaMP")
 
-if st.button("Analyze"):
-    st.info("Querying RaMP database...")
-    pathways = query_ramp(analyte_id, analyte_type)
-    if pathways:
-        st.success(f"Found {len(pathways)} pathways related to {analyte_id}")
-        enriched_pathways = enrichment_analysis(pathways)
-        df = pd.DataFrame(enriched_pathways)
-        st.dataframe(df)
+analyte_input = st.text_input("Enter Analyte ID or Common Name (e.g., P04637 or Glucose):")
+analyte_type = st.selectbox("Select Analyte Type", ["protein", "metabolite"])
 
-        # Create and display network graph
-        G = create_network_graph(enriched_pathways, analyte_id)
-        net = Network(notebook=False)
-        net.from_nx(G)
-        graph_path = os.path.join(tempfile.gettempdir(), "network_graph.html")
-        net.save_graph(graph_path)
-        st.components.v1.html(open(graph_path, 'r').read(), height=500)
-
-        # Download options
-        csv_file = save_csv(enriched_pathways)
-        pdf_file = save_pdf(enriched_pathways)
-        st.download_button("Download CSV", open(csv_file, "rb"), file_name="enrichment_results.csv")
-        st.download_button("Download PDF", open(pdf_file, "rb"), file_name="enrichment_results.pdf")
+if st.button("Query Pathways"):
+    if not analyte_input:
+        st.warning("Please enter an analyte ID or name.")
     else:
-        st.error("No pathways found or error querying RaMP API.")
+        analyte_id = analyte_input
+        if not analyte_input.upper().startswith(("P", "Q", "HMDB")):
+            mapped_id = map_common_name_to_hmdb(analyte_input)
+            if mapped_id:
+                analyte_id = mapped_id
+                st.info(f"Mapped '{analyte_input}' to HMDB ID: {analyte_id}")
+            else:
+                st.error("Could not map common name to ID.")
+                st.stop()
+
+        data = query_ramp_api(analyte_id, analyte_type)
+        if not data:
+            st.error("No data returned from RaMP API.")
+        else:
+            df = perform_enrichment(data)
+            st.subheader("Enriched Pathways")
+            st.dataframe(df)
+
+            # Download buttons
+            st.download_button("Download CSV", download_csv(df), file_name="enriched_pathways.csv")
+            pdf_path = download_pdf(df)
+            with open(pdf_path, "rb") as f:
+                st.download_button("Download PDF", f, file_name="enriched_pathways.pdf")
+
+            # Network graph
+            st.subheader("Pathway Network Graph")
+            html_path = create_network_graph(analyte_id, df)
+            with open(html_path, "r", encoding="utf-8") as f:
+                html_content = f.read()
+                st.components.v1.html(html_content, height=550, scrolling=True)
 
