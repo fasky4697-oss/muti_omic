@@ -102,9 +102,3 @@ fig.update_layout(
 # Display graph
 st.plotly_chart(fig, use_container_width=True)
 
-# Instructions for running
-st.markdown("---")
-st.markdown("### 🛠️ How to Run This App")
-st.code("streamlit run app.py", language="bash")
-st.markdown("Make sure to save this code in a file named `app.py` and run the command above in your terminal.")
-
