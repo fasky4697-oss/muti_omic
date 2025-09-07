@@ -3,4 +3,4 @@ pandas
 requests
 networkx
 pyvis
-fpdf
+PyMuPDF
