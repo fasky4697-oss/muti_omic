@@ -5,127 +5,135 @@ import networkx as nx
 from pyvis.network import Network
 import tempfile
 import os
-from fpdf import FPDF
+import fitz  # PyMuPDF
+from io import BytesIO
 
-# -------------------------------
-# Configuration
-# -------------------------------
-RAMP_API_URLS = [
-    "https://rampdb.nih.gov/api/query"
-]
+# RaMP API endpoint
+RAMP_API_URL = "https://rampdb.nih.gov/api/pathways-from-analytes"
 
-# -------------------------------
-# Helper Functions
-# -------------------------------
-
+# MetaboAnalyst mapping function
 def map_common_name_to_hmdb(common_name):
-    """Mock function to map common name to HMDB ID"""
-    # In production, replace with actual lookup or API call
-    mapping = {
-        "glucose": "HMDB0000122",
-        "lactic acid": "HMDB0000190",
-        "citrate": "HMDB0000094"
-    }
-    return mapping.get(common_name.lower(), None)
+    # MetaboAnalyst uses a web form, so we simulate a query via their conversion tool
+    # This is a workaround using their web interface
+    search_url = f"https://www.metaboanalyst.ca/resources/data/compound_name_mapping.csv"
+    try:
+        response = requests.get(search_url)
+        if response.status_code == 200:
+            df = pd.read_csv(BytesIO(response.content))
+            match = df[df['Name'].str.lower() == common_name.lower()]
+            if not match.empty:
+                return match.iloc[0]['HMDB']
+    except Exception as e:
+        print(f"Error mapping name: {e}")
+    return None
 
+# Query RaMP API
 def query_ramp_api(analyte_id, analyte_type):
-    """Query RaMP API for pathway information"""
     prefix = "hmdb" if analyte_type == "metabolite" else "uniprot"
     full_id = f"{prefix}:{analyte_id}"
     payload = {
         "input": [full_id],
         "type": "pathway"
     }
-
-    for url in RAMP_API_URLS:
-        try:
-            response = requests.post(url, json=payload)
-            if response.status_code == 200:
-                return response.json()
-        except requests.exceptions.RequestException:
-            continue
+    try:
+        response = requests.post(RAMP_API_URL, json=payload)
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        st.error(f"API connection failed: {e}")
     return {}
 
-def perform_enrichment(pathway_data):
-    """Mock enrichment analysis"""
-    enriched = []
-    for entry in pathway_data:
-        enriched.append({
-            "pathway": entry.get("pathway_name", "Unknown"),
-            "source": entry.get("source", "RaMP"),
-            "score": round(1.0 / (1 + len(entry.get("analyte_list", []))), 4)
-        })
-    return pd.DataFrame(enriched)
+# Generate network graph
+def generate_network_graph(analyte_id, pathways):
+    g = nx.Graph()
+    g.add_node(analyte_id, label=analyte_id, color='red')
+    for pw in pathways:
+        pw_name = pw.get('name', 'Unknown')
+        g.add_node(pw_name, label=pw_name, color='blue')
+        g.add_edge(analyte_id, pw_name)
+    return g
 
-def create_network_graph(analyte_id, pathway_df):
-    """Create a network graph using pyvis"""
-    net = Network(height="500px", width="100%", notebook=False)
-    net.add_node(analyte_id, label=analyte_id, color="red")
-
-    for _, row in pathway_df.iterrows():
-        net.add_node(row["pathway"], label=row["pathway"], color="lightblue")
-        net.add_edge(analyte_id, row["pathway"])
-
+# Save network graph as HTML
+def save_network_html(graph):
+    net = Network(height="600px", width="100%", notebook=False)
+    net.from_nx(graph)
     temp_dir = tempfile.mkdtemp()
     html_path = os.path.join(temp_dir, "network.html")
-    net.show(html_path)
+    net.save_graph(html_path)
     return html_path
 
-def download_csv(df):
-    return df.to_csv(index=False).encode("utf-8")
+# Save results to CSV
+def save_results_csv(pathways):
+    df = pd.DataFrame(pathways)
+    temp_dir = tempfile.mkdtemp()
+    csv_path = os.path.join(temp_dir, "results.csv")
+    df.to_csv(csv_path, index=False)
+    return csv_path
 
-def download_pdf(df):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", size=12)
-    for i, row in df.iterrows():
-        line = f"{row['pathway']} (Score: {row['score']})"
-        pdf.cell(200, 10, txt=line, ln=True)
-    temp_path = tempfile.mktemp(suffix=".pdf")
-    pdf.output(temp_path)
-    return temp_path
+# Save results to PDF
+def save_results_pdf(pathways):
+    temp_dir = tempfile.mkdtemp()
+    pdf_path = os.path.join(temp_dir, "results.pdf")
+    doc = fitz.open()
+    page = doc.new_page()
+    text = "Pathway Results:\n\n"
+    for pw in pathways:
+        text += f"- {pw.get('name', 'Unknown')} (Source: {pw.get('source', 'N/A')})\n"
+    page.insert_text((72, 72), text, fontsize=12)
+    doc.save(pdf_path)
+    return pdf_path
 
-# -------------------------------
-# Streamlit App
-# -------------------------------
-
+# Streamlit UI
 st.title("Multi-Omic Pathway Explorer using RaMP")
 
-analyte_input = st.text_input("Enter Analyte ID or Common Name (e.g., P04637 or Glucose):")
+st.markdown("""
+Enter either an **Analyte ID** (e.g., UniProt ID like `P04637` or HMDB ID like `HMDB0000122`)  
+or a **common name** (e.g., `Glucose`, `Lactic acid`).  
+If you enter a common name, the system will automatically map it to the correct HMDB ID and analyte type.
+""")
+
+analyte_input = st.text_input("Enter Analyte ID or Common Name:")
 analyte_type = st.selectbox("Select Analyte Type", ["protein", "metabolite"])
 
 if st.button("Query Pathways"):
-    if not analyte_input:
-        st.warning("Please enter an analyte ID or name.")
-    else:
-        analyte_id = analyte_input
-        if not analyte_input.upper().startswith(("P", "Q", "HMDB")):
+    if analyte_input:
+        mapped_id = None
+        if analyte_type == "metabolite" and not analyte_input.lower().startswith("hmdb"):
             mapped_id = map_common_name_to_hmdb(analyte_input)
             if mapped_id:
+                st.success(f"Mapped '{analyte_input}' to HMDB ID: {mapped_id}")
                 analyte_id = mapped_id
-                st.info(f"Mapped '{analyte_input}' to HMDB ID: {analyte_id}")
+                analyte_type = "metabolite"
             else:
-                st.error("Could not map common name to ID.")
+                st.error("Could not map common name to HMDB ID.")
                 st.stop()
-
-        data = query_ramp_api(analyte_id, analyte_type)
-        if not data:
-            st.error("No data returned from RaMP API.")
         else:
-            df = perform_enrichment(data)
-            st.subheader("Enriched Pathways")
+            analyte_id = analyte_input
+
+        result = query_ramp_api(analyte_id, analyte_type)
+        if result and isinstance(result, list) and len(result) > 0:
+            st.success(f"Found {len(result)} pathways.")
+            df = pd.DataFrame(result)
             st.dataframe(df)
 
-            # Download buttons
-            st.download_button("Download CSV", download_csv(df), file_name="enriched_pathways.csv")
-            pdf_path = download_pdf(df)
-            with open(pdf_path, "rb") as f:
-                st.download_button("Download PDF", f, file_name="enriched_pathways.pdf")
-
             # Network graph
-            st.subheader("Pathway Network Graph")
-            html_path = create_network_graph(analyte_id, df)
-            with open(html_path, "r", encoding="utf-8") as f:
+            graph = generate_network_graph(analyte_id, result)
+            html_path = save_network_html(graph)
+            with open(html_path, 'r', encoding='utf-8') as f:
                 html_content = f.read()
-                st.components.v1.html(html_content, height=550, scrolling=True)
+            st.components.v1.html(html_content, height=600)
+
+            # Download buttons
+            csv_path = save_results_csv(result)
+            pdf_path = save_results_pdf(result)
+
+            with open(csv_path, "rb") as f:
+                st.download_button("Download CSV", f, file_name="results.csv")
+
+            with open(pdf_path, "rb") as f:
+                st.download_button("Download PDF", f, file_name="results.pdf")
+        else:
+            st.warning("No pathways found for the given analyte.")
+    else:
+        st.warning("Please enter an analyte ID or name.")
 
